@@ -1,0 +1,15 @@
+streamlit
+pymupdf
+pillow
+opencv-python-headless
+pytesseract
+surya-ocr
+layoutparser
+torch
+transformers
+sentence-transformers
+chromadb
+rank-bm25
+langchain-text-splitters
+numpy
+pandas
