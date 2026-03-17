@@ -18,6 +18,9 @@ import torch
 # -------- Surya OCR --------
 from surya.models import load_predictors
 from surya.table_rec import TableRecPredictor  # NEW: Table recognition
+from surya.layout import LayoutPredictor
+from surya.settings import settings
+from surya.foundation import FoundationPredictor
 
 # -------- LangChain --------
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -50,7 +53,6 @@ st.sidebar.write(f"🖥 Device: **{DEVICE}**")
 @st.cache_resource
 def load_surya():
     predictors = load_predictors(
-        names=["detection", "layout", "recognition", "ordering"], 
         device=DEVICE
     )
     predictors["table_rec"] = TableRecPredictor(device=DEVICE)
@@ -137,77 +139,43 @@ def pdf_to_images(pdf_path: str, dpi: int = 400) -> List[Image.Image]:  # Increa
 # -------- SURYA OCR (UPDATED: Full pipeline + table structure) --------
 def surya_ocr(images):
     det = predictors["detection"]
-    layout_predictor = predictors["layout"]
     rec = predictors["recognition"]
-    order = predictors["ordering"]
+    order = predictors.get("ordering")
     table_rec = predictors["table_rec"]
-    
+
+    layout_predictor = LayoutPredictor(
+        FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
+    )
+
     full_texts = []
-    
+
     for img_idx, img in enumerate(images):
         st.info(f"🔎 Processing page {img_idx + 1}...")
-        
-        # 1. Detection
+
+        # ✅ NOW img exists
         lines = det([img])
-        
-        # 2. Layout analysis (detects tables, paragraphs, etc.)
-        layouts = layout_predictor([img], lines)
-        
-        # 3. Recognition (OCR)
+
+        layouts = layout_predictor([img]) # ✔️ correct place
+
         recs = rec(
             images=[img],
             task_names=["ocr_with_boxes"],
             det_predictor=det
-        )[0]  # Single image
-        
-        # 4. Reading order
-        orders = order([img], [recs.bboxes])
-        ordered_indices = orders[0].order
-        
-        # 5. Extract ordered text
+        )[0]
+
+        if order:
+            orders = order([img], [recs.bboxes])
+            ordered_indices = orders[0].order
+        else:
+            ordered_indices = list(range(len(recs.text_lines)))
+
         page_parts = []
         for idx in ordered_indices:
             if idx < len(recs.text_lines):
                 page_parts.append(recs.text_lines[idx].text.strip())
-        
-        # 6. Table recognition
-        table_preds = table_rec([img])
-        table_md = []
-        
-        for table in table_preds:
-            if hasattr(table, 'cells') and table.cells:
-                # Sort cells by row_id, col_id
-                sorted_cells = sorted(table.cells, key=lambda c: (getattr(c, 'row_id', 0), getattr(c, 'col_id', 0)))
-                
-                # Group by rows
-                rows = {}
-                for cell in sorted_cells:
-                    row_id = getattr(cell, 'row_id', 0)
-                    col_id = getattr(cell, 'col_id', 0)
-                    cell_text = getattr(cell, 'text', '').strip()
-                    if row_id not in rows:
-                        rows[row_id] = {}
-                    rows[row_id][col_id] = cell_text
-                
-                # Build markdown table
-                if rows:
-                    headers = list(rows[min(rows.keys())].keys())
-                    num_cols = len(headers)
-                    
-                    # Header row
-                    table_md.append("| " + " | ".join([f"Col{i+1}" for i in range(num_cols)]) + " |")
-                    table_md.append("| " + " | ".join(["---"] * num_cols) + " |")
-                    
-                    # Data rows (sorted by row_id)
-                    for row_id in sorted(rows.keys()):
-                        row_data = [rows[row_id].get(col, '') for col in headers]
-                        table_md.append("| " + " | ".join(row_data) + " |")
-                    table_md.append("")  # Table separator
-        
-        # Combine text + tables
-        page_text = "\n".join(page_parts + table_md)
-        full_texts.append(clean_text(page_text))
-    
+
+        full_texts.append(clean_text("\n".join(page_parts)))
+
     return full_texts
 
 # -------- VECTOR DATABASE (UPDATED: Smaller chunks for tables) --------
