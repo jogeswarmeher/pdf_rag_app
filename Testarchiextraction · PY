@@ -1,0 +1,219 @@
+import requests
+import uuid
+import time
+import os
+import re
+import json
+import base64
+
+# ---------------- CONFIG ----------------
+NEMO_API_URL = "http://localhost:7670/v1/submit_job"
+RESULT_URL   = "http://localhost:7670/v1/result"
+IMAGE_PATH   = "image/archi1.jpg"
+
+POLL_INTERVAL = 5    # seconds
+MAX_RETRIES   = 30
+
+
+# ---------------- FUNCTIONS ----------------
+
+def submit_job(image_path: str) -> str:
+    """Submit image as base64 JSON wrapped in 'payload' key and return trace_id"""
+
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    trace_id = str(uuid.uuid4())
+
+    # Encode image → base64
+    with open(image_path, "rb") as f:
+        encoded_image = base64.b64encode(f.read()).decode("utf-8")
+
+    # ✅ FIX: Wrap everything inside "payload" key as required by the API
+    body = {
+        "payload": {
+            "trace_id": trace_id,
+            "inputs": [
+                {
+                    "type": "image",
+                    "content": encoded_image
+                }
+            ],
+            "parameters": {
+                "model": "nvidia/nemoretriever-document-qa",
+                "tasks": ["ocr", "layout_detection", "entity_extraction"]
+            }
+        }
+    }
+
+    try:
+        response = requests.post(
+            NEMO_API_URL,
+            json=body,
+            timeout=60
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to connect to NV-Ingest: {e}")
+
+    if response.status_code != 200:
+        raise Exception(f"Error submitting job: {response.status_code} {response.text}")
+
+    print(f"Job submitted successfully! trace_id={trace_id}")
+    return trace_id
+
+
+def poll_result(trace_id: str) -> dict:
+    """Poll NV-Ingest until job completes or max retries exceeded"""
+
+    retries = 0
+
+    while retries < MAX_RETRIES:
+        try:
+            response = requests.get(
+                RESULT_URL,
+                params={"trace_id": trace_id},
+                timeout=30
+            )
+        except requests.exceptions.RequestException:
+            print(f"Waiting for NV-Ingest... ({retries + 1}/{MAX_RETRIES})")
+            time.sleep(POLL_INTERVAL)
+            retries += 1
+            continue
+
+        if response.status_code != 200:
+            print(f"Waiting for result... status={response.status_code} ({retries + 1}/{MAX_RETRIES})")
+            time.sleep(POLL_INTERVAL)
+            retries += 1
+            continue
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            print(f"Invalid JSON response... retrying ({retries + 1}/{MAX_RETRIES})")
+            time.sleep(POLL_INTERVAL)
+            retries += 1
+            continue
+
+        status = data.get("status", "pending")
+
+        if status == "completed":
+            print("Job completed successfully!")
+            return data
+        elif status == "failed":
+            raise Exception(f"Job failed: {json.dumps(data, indent=2)}")
+        else:
+            print(f"Job status: {status} ({retries + 1}/{MAX_RETRIES})")
+            time.sleep(POLL_INTERVAL)
+            retries += 1
+
+    raise TimeoutError(f"Polling exceeded max retries ({MAX_RETRIES}). Last trace_id: {trace_id}")
+
+
+def parse_output(result: dict) -> dict:
+    """
+    Extract rooms and their dimensions from the OCR output.
+    Looks for Spanish room keywords and dimension patterns like '3.5 x 4 m'.
+    """
+
+    room_keywords = [
+        "RECAMARA", "COCINA", "SALA", "BAÑO", "COMEDOR",
+        "PASILLO", "GARAGE", "JARDIN", "TERRAZA", "ESTUDIO"
+    ]
+
+    # ✅ FIX: Corrected regex — removed erroneous double backslash escaping
+    dimension_pattern = re.compile(
+        r"(\d+(\.\d+)?\s*[xX×]\s*\d+(\.\d+)?\s*m?)", re.IGNORECASE
+    )
+
+    parsed = {}
+    current_room = None
+
+    ocr_blocks = result.get("ocr", [])
+
+    if not ocr_blocks:
+        print("Warning: No OCR blocks found in result. Check the result structure.")
+        return parsed
+
+    for block in ocr_blocks:
+        text = block.get("text", "").upper().strip()
+
+        if not text:
+            continue
+
+        # Detect room name
+        matched_room = None
+        for room in room_keywords:
+            if room in text:
+                matched_room = room
+                break
+
+        if matched_room:
+            current_room = matched_room
+            if current_room not in parsed:
+                parsed[current_room] = {"dimensions": None, "raw_texts": []}
+
+        # Collect raw text per room
+        if current_room:
+            parsed[current_room]["raw_texts"].append(text)
+
+            # Detect dimensions like "3.5 x 4 m" or "3 x 4.2"
+            match = dimension_pattern.search(text)
+            if match and parsed[current_room]["dimensions"] is None:
+                parsed[current_room]["dimensions"] = match.group(0).strip()
+
+    return parsed
+
+
+def save_results(result: dict, parsed: dict) -> None:
+    """Save raw JSON result and structured parsed output to files"""
+
+    # Save raw API response
+    raw_output_path = "ocr_result.json"
+    with open(raw_output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"Raw response saved → {raw_output_path}")
+
+    # Save structured parsed output
+    parsed_output_path = "parsed_rooms.json"
+    with open(parsed_output_path, "w", encoding="utf-8") as f:
+        json.dump(parsed, f, indent=2, ensure_ascii=False)
+    print(f"Parsed rooms saved  → {parsed_output_path}")
+
+
+# ---------------- MAIN ----------------
+
+if __name__ == "__main__":
+    try:
+        print("Waiting 5 seconds for NV-Ingest service to be ready...")
+        time.sleep(5)
+
+        # 1️⃣ Submit job
+        trace_id = submit_job(IMAGE_PATH)
+
+        # 2️⃣ Poll for result
+        result = poll_result(trace_id)
+
+        # 3️⃣ Parse structured output
+        parsed = parse_output(result)
+
+        # 4️⃣ Save results to disk
+        save_results(result, parsed)
+
+        # 5️⃣ Print to console
+        print("\n--- RAW RESPONSE ---")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        print("\n--- STRUCTURED OUTPUT (Rooms & Dimensions) ---")
+        if parsed:
+            for room, info in parsed.items():
+                dims = info.get("dimensions") or "Not detected"
+                print(f"  {room}: {dims}")
+        else:
+            print("  No rooms detected. Check room_keywords or OCR output structure.")
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+    except TimeoutError as e:
+        print(f"Timeout: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
